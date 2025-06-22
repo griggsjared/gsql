@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/goforj/godump"
+	_ "github.com/goforj/godump"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
@@ -25,40 +25,25 @@ func main() {
 
 	switch command {
 	case ".dbinfo":
-		databaseFile, err := os.Open(databaseFilePath)
+		file, err := os.Open(databaseFilePath)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		header := NewDatabaseHeader()
-		_, err = databaseFile.Read(header)
+		databaseFile := DatabaseFile{file}
+
+		header, err := databaseFile.GetHeader()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		_, err = databaseFile.Seek(0, 0)
+		masterPage, err := databaseFile.GetPage(1, header.PageSize())
 		if err != nil {
 			log.Fatal(err)
 		}
-
-		page := NewDatabasePage(header.PageSize())
-		godump.Dump(page)
-
-		// pages := make([]DatabasePage, 0)
-		// for range header.NumberPages() {
-		// 	page := NewDatabasePage(header.PageSize())
-		// 	_, err = databaseFile.Read(page)
-		// 	if err != nil {
-		// 		log.Fatal(err)
-		// 	}
-		// 	pages = append(pages, page)
-		// }
-
-		// godump.Dump(header)
-		// godump.Dump(pages)
 
 		fmt.Printf("database page size: %v\n", header.PageSize())
-		fmt.Printf("number of pages: %v\n", header.NumberPages())
+		fmt.Printf("number of tables: %d\n", masterPage.NumberCells())
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
@@ -69,6 +54,83 @@ const (
 	DatabaseHeaderSize = 100
 	DatabasePageSize   = 4096 // Default page size for SQLite
 )
+
+type BTreePageType int
+
+const (
+	PageTypeUnknown BTreePageType = iota
+	PageTypeIndexInterior
+	PageTypeTableInterior
+	PageTypeIndexLeaf
+	PageTypeTableLeaf
+)
+
+func (b BTreePageType) String() string {
+	switch b {
+	case PageTypeIndexInterior:
+		return "Index Interior"
+	case PageTypeTableInterior:
+		return "Table Interior"
+	case PageTypeIndexLeaf:
+		return "Index Leaf"
+	case PageTypeTableLeaf:
+		return "Table Leaf"
+	default:
+		return "Unknown Page Type"
+	}
+}
+
+type DatabaseFile struct {
+	*os.File
+}
+
+func (f DatabaseFile) GetPage(number uint16, pageSize uint16) (DatabasePage, error) {
+	if number == 0 {
+		return nil, fmt.Errorf("page number cannot be zero")
+	}
+
+	//master page
+	var offset int64
+	if number == 1 {
+		offset = int64(DatabaseHeaderSize)
+		pageSize = uint16(pageSize) - uint16(offset)
+	} else {
+		offset = int64((number - 1) * pageSize)
+	}
+
+	_, err := f.Seek(offset, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek to page %d: %w", number, err)
+	}
+
+	page := NewDatabasePage(pageSize)
+	used, err := f.Read(page)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read page %d: %w", number, err)
+	}
+
+	if used < int(pageSize) {
+		return nil, fmt.Errorf("read less bytes than expected for page %d: expected %d, got %d", number, pageSize, used)
+	}
+
+	return page, nil
+}
+
+func (f DatabaseFile) GetHeader() (DatabaseHeader, error) {
+
+	_, err := f.Seek(0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek to the beginning of the file: %w", err)
+	}
+
+	header := NewDatabaseHeader()
+	_, err = f.Read(header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read database header: %w", err)
+	}
+
+	return header, nil
+}
 
 type DatabaseHeader []byte
 
@@ -91,4 +153,26 @@ func NewDatabasePage(size uint16) DatabasePage {
 		size = DatabasePageSize
 	}
 	return make(DatabasePage, size)
+}
+
+func (p DatabasePage) PageType() BTreePageType {
+	switch p[0] {
+	case 0x02:
+		return PageTypeIndexInterior
+	case 0x05:
+		return PageTypeTableInterior
+	case 0x0A:
+		return PageTypeIndexLeaf
+	case 0x0D:
+		return PageTypeTableLeaf
+	default:
+		return PageTypeUnknown
+	}
+}
+
+func (p DatabasePage) NumberCells() uint16 {
+	if len(p) < 2 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(p[3:5])
 }
